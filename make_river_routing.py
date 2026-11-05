@@ -12,7 +12,27 @@ Rule:
     counted as lost rather than put into the ocean.
   * Ocean cells are not routed and hold -2.
 
-Output (netCDF, on the mask file's (nj, ni) layout):
+Main output: an ESMF offline weight file (same layout as ESMF_RegridWeightGen
+output, readable by jem/utils/esmf_regrid.py's ESMFRegridder), source and
+destination both the same grid:
+  row, col, S     sparse matrix (1-based flat indices, longitude fastest, i.e.
+                  j * ni + i + 1): one entry per routed land cell, col = the
+                  land cell, row = its coastal cell,
+                  S = area(land cell) / area(coastal cell)
+  The input field must be a flux per unit area (e.g. kg m-2 s-1). The output
+  is the river input per unit area of the destination cells, zero elsewhere;
+  area-weighted totals are conserved apart from the lost cells, which have no
+  entry. Ocean cells have no entry either: the output is river input only and
+  must be added to the ocean's own freshwater flux by the caller. Negative
+  values (land P-E < 0) pass through unchanged; clipping is up to the caller.
+  src_grid_dims, dst_grid_dims   (ni, nj), as in ESMF files
+  xc/yc, xv/yv, area (square radians)   from the SCRIP grid, _a and _b
+  mask_a          1 on land (cells that may be routed)
+  mask_b          1 on ocean
+  frac_a          1 on routed land cells, 0 elsewhere (0 on lost cells)
+  frac_b          1 on coastal cells that receive water, 0 elsewhere
+
+Optional --diagnostics file (netCDF, on the mask file's (nj, ni) layout):
   routing_index   flat index j * ni + i of the destination coastal cell, or
                   -1 (lost) / -2 (ocean cell)
   routing_j, routing_i   the same destination as (nj, ni) indices, or -1/-2
@@ -26,7 +46,8 @@ Output (netCDF, on the mask file's (nj, ni) layout):
 
 Example (from this repository's top directory):
     python make_river_routing.py grid_ESM_collocated/ocn_topo_JCM_T31.nc \\
-        grid_ESM_collocated/JCM_T31.SCRIP.nc river_routing_JCM_T31.nc --plot river_routing.png
+        grid_ESM_collocated/JCM_T31.SCRIP.nc weight_river_routing_JCM_T31.nc \\
+        --diagnostics river_routing_JCM_T31.nc --plot figures/river_routing.png
 """
 import argparse
 
@@ -39,7 +60,9 @@ OCEAN, LOST = -2, -1
 parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 parser.add_argument("mask_file", help="Land-sea mask file with landsea_mask (1 = land) and lat/lon on (nj, ni).")
 parser.add_argument("scrip_file", help="SCRIP grid file of the same grid, for the cell areas.")
-parser.add_argument("out_file", help="Output netCDF file.")
+parser.add_argument("out_file", help="Output ESMF weight file (netCDF).")
+parser.add_argument("--diagnostics", metavar="NC",
+                    help="Also write the routing as (nj, ni) index maps, distances and masks, for checking.")
 parser.add_argument("--max-distance-km", type=float, default=500.0,
                     help="Farthest a land cell may be from its coastal cell (default 500).")
 parser.add_argument("--plot", metavar="PNG", help="Also draw a map of the routing for checking.")
@@ -113,14 +136,62 @@ out = xr.Dataset(
         "scrip_file": args.scrip_file,
     },
 )
-out.to_netcdf(args.out_file)
+if args.diagnostics:
+    out.to_netcdf(args.diagnostics)
+
+# ESMF weight file. Flat index j * ni + i is the SCRIP/ESMF order (grid_dims = [ni, nj], longitude fastest);
+# the layout check against grid_center_lat above guarantees the SCRIP cells are in this order.
+area_sr = scrip["grid_area"].values                                   # steradians, flat
+src = land_j[routed] * ni + land_i[routed]
+dst = coast_j[nearest[routed]] * ni + coast_i[nearest[routed]]
+order = np.argsort(dst, kind="stable")                                # sorted by row, like ESMF output
+src, dst = src[order], dst[order]
+S = area_sr[src] / area_sr[dst]
+frac_a = np.zeros(nj * ni); frac_a[src] = 1.0
+frac_b = np.zeros(nj * ni); frac_b[dst] = 1.0
+grid_dims = np.array([ni, nj], dtype=np.int32)
+center = {"yc": scrip["grid_center_lat"].values, "xc": scrip["grid_center_lon"].values}
+corner = {"yv": scrip["grid_corner_lat"].values, "xv": scrip["grid_corner_lon"].values}
+deg = {"units": "degrees"}
+wvars = {
+    "src_grid_dims": ("src_grid_rank", grid_dims),
+    "dst_grid_dims": ("dst_grid_rank", grid_dims),
+    "col": ("n_s", (src + 1).astype(np.int32)),
+    "row": ("n_s", (dst + 1).astype(np.int32)),
+    "S": ("n_s", S),
+}
+for side, mask, frac in (("a", land, frac_a), ("b", ~land, frac_b)):
+    n, nv = f"n_{side}", f"nv_{side}"
+    for name, v in center.items():
+        wvars[f"{name}_{side}"] = (n, v, deg)
+    for name, v in corner.items():
+        wvars[f"{name}_{side}"] = ((n, nv), v, deg)
+    wvars[f"mask_{side}"] = (n, mask.ravel().astype(np.int32), {"units": "unitless"})
+    wvars[f"area_{side}"] = (n, area_sr, {"units": "square radians"})
+    wvars[f"frac_{side}"] = (n, frac, {"units": "unitless"})
+weights = xr.Dataset(wvars, attrs={
+    "title": "Nearest-coast river routing weights (ESMF offline weight file layout)",
+    "normalization": "destarea",
+    "map_method": "Nearest-coast river routing",
+    "rule": "land cell -> nearest coastal ocean cell (great-circle, cell centres) if within max_distance_km; "
+            "S = area_src / area_dst, so a per-unit-area flux is conserved; lost land cells and ocean cells have "
+            "no entry (output is river input only)",
+    "max_distance_km": args.max_distance_km,
+    "conventions": "NCAR-CSM",
+    "domain_a": args.scrip_file, "domain_b": args.scrip_file,
+    "grid_file_src": args.scrip_file, "grid_file_dst": args.scrip_file,
+    "mask_file": args.mask_file,
+})
+weights.to_netcdf(args.out_file, encoding={v: {"_FillValue": None} for v in weights.data_vars})
 
 n_land, n_lost = len(land_j), int(np.sum(~routed))
 lost_area = area[land_j[~routed], land_i[~routed]].sum()
 print(f"{n_land} land cells: {n_land - n_lost} routed to {len(np.unique(nearest[routed]))} of {coastal.sum()} "
       f"coastal cells, {n_lost} lost (> {args.max_distance_km:g} km; {lost_area / area[land].sum():.1%} of the land area)")
 print(f"routed distance: median {np.median(nearest_km[routed]):.0f} km, max {nearest_km[routed].max():.0f} km")
-print("saved", args.out_file)
+print(f"saved {args.out_file} ({len(S)} weights)")
+if args.diagnostics:
+    print("saved", args.diagnostics)
 
 if args.plot:
     import matplotlib; matplotlib.use("Agg")
@@ -148,5 +219,7 @@ if args.plot:
     ax.legend(loc="lower left", fontsize=8)
     ax.set_title(f"Nearest-coast river routing, max distance {args.max_distance_km:g} km "
                  f"(grey lines: land cell -> coastal ocean cell)", fontsize=11)
+    import os
+    os.makedirs(os.path.dirname(args.plot) or ".", exist_ok=True)
     fig.savefig(args.plot, dpi=110, bbox_inches="tight")
     print("saved", args.plot)
